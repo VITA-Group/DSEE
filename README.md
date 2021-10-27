@@ -20,6 +20,13 @@ conda activate dsee
 ## Command
 
 ### Unstructured DSEE
+#### Step 0.
+
+```bash
+cd non-GPT-2
+pip install -e .
+cd ..
+```
 
 #### Step 1. Pre-training
 
