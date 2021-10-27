@@ -87,3 +87,5 @@ python -m torch.distributed.launch \
 ```
 
 ## TODO
+- [ ] Codes for Unstructured DSEE on GPT-2
+- [ ] Codes for Structured DSEE
