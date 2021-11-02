@@ -1,7 +1,7 @@
 # DSEE
 
 
-Codes for [Preprint][Bag of Tricks for Training Deeper Graph Neural Networks: A Comprehensive Benchmark Study](https://arxiv.org/abs/2111.00160)
+Codes for [Preprint][DSEE: Dually Sparsity-embedded Efficient Tuning of Pre-trained Language Models](https://arxiv.org/abs/2111.00160)
 
 Xuxi Chen, Tianlong Chen, Yu Cheng, Weizhu Chen, Zhangyang Wang, Ahmed Hassan Awadallahp
 
