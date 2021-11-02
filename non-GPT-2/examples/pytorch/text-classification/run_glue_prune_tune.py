@@ -370,13 +370,7 @@ def main():
 
             print(name, f"requires_grad: {param.requires_grad}")
         
-    if model_args.apply_sparse:
-        for name, module in model.named_modules():
-            if name.endswith("self") and name.startswith("bert"):
-                S_Q = (module.query_lora_s.weight.data.abs() > 0).float()
-                S_V = (module.value_lora_s.weight.data.abs() > 0).float()
-                prune.custom_from_mask(module.query_lora_s, 'weight', S_Q)
-                prune.custom_from_mask(module.value_lora_s, 'weight', S_V)
+
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
@@ -507,6 +501,19 @@ def main():
     else:
         data_collator = None
     
+    if model_args.apply_sparse:
+        try:
+            checkpoint = torch.load(model_args.model_name_or_path, map_location="cpu")
+        except:
+            checkpoint = torch.load(os.path.join(model_args.model_name_or_path, "pytorch_model.bin"), map_location="cpu")
+        
+        for name, module in model.named_modules():
+            if name.endswith("self"):
+                prune.custom_from_mask(module.query_lora_s, 'weight', checkpoint[name + ".query_lora_s.weight_mask"])
+                module.query_lora_s.weight_orig.data = checkpoint[name + ".query_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
+                prune.custom_from_mask(module.value_lora_s, 'weight', checkpoint[name + ".value_lora_s.weight_mask"])
+                module.value_lora_s.weight_orig.data = checkpoint[name + ".value_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
+                
     if model_args.apply_lora:
         if model_args.lora_path is not None:
             lora_state_dict = torch.load(model_args.lora_path, map_location="cpu")
@@ -569,21 +576,7 @@ def main():
         return 100*(1-zero_sum/sum_list)
 
     check_sparsity(model)
-
-    if model_args.apply_sparse:
-        try:
-            checkpoint = torch.load(model_args.model_name_or_path, map_location="cpu")
-        except:
-            checkpoint = torch.load(os.path.join(model_args.model_name_or_path, "pytorch_model.bin"), map_location="cpu")
-        
-        for name, module in model.named_modules():
-            if name.endswith("self"):
-                prune.custom_from_mask(module.query_lora_s, 'weight', checkpoint[name + ".query_lora_s.weight_mask"])
-                module.query_lora_s.weight_orig.data = checkpoint[name + ".query_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
-                prune.custom_from_mask(module.value_lora_s, 'weight', checkpoint[name + ".value_lora_s.weight_mask"])
-                module.value_lora_s.weight_orig.data = checkpoint[name + ".value_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
             
-
     # Initialize our Trainer
     trainer = Trainer(
         model=model,
