@@ -1,7 +1,7 @@
 # DSEE
 
 
-Codes for [Preprint][DSEE: Dually Sparsity-embedded Efficient Tuning of Pre-trained Language Models](https://arxiv.org/abs/2111.00160)
+Codes for [Preprint] [DSEE: Dually Sparsity-embedded Efficient Tuning of Pre-trained Language Models](https://arxiv.org/abs/2111.00160)
 
 Xuxi Chen, Tianlong Chen, Yu Cheng, Weizhu Chen, Zhangyang Wang, Ahmed Hassan Awadallahp
 
@@ -96,3 +96,7 @@ python -m torch.distributed.launch \
 ## TODO
 - [ ] Codes for Unstructured DSEE on GPT-2
 - [ ] Codes for Structured DSEE
+
+## Acknowledgement
+
+1. The Huggingface's Transformers ([https://github.com/huggingface/transformers](https://github.com/huggingface/transformers))
