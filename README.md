@@ -1,14 +1,14 @@
 # DSEE
 
-Codes for DSEE
+
+Codes for [Preprint][Bag of Tricks for Training Deeper Graph Neural Networks: A Comprehensive Benchmark Study](https://arxiv.org/abs/2111.00160)
+
+Xuxi Chen, Tianlong Chen, Yu Cheng, Weizhu Chen, Zhangyang Wang, Ahmed Hassan Awadallahp
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
 ## Overview
-
-
-## Experiment Results
-
+TBD
 ## Requirements
 
 We use `conda` to create virtual environments. 
