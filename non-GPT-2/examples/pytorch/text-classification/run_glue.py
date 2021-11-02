@@ -403,6 +403,7 @@ def main():
 
                     for rank in range(100):
                         S_Q = torch.zeros_like(Q_weight)
+                        S_V = torch.zeros_like(V_weight)
                         for _ in range(10):
                             #print(_, residual_change)
                             U_Q = torch.qr((Q_weight - S_Q) @ V_Q.T)[0]
@@ -451,6 +452,7 @@ def main():
                     residual_change = 0
                     for rank in range(100):
                         S_Q = torch.zeros_like(Q_weight)
+                        S_V = torch.zeros_like(V_weight)
                         for _ in range(10):
                             #print(_, residual_change)
                             U_Q = torch.qr((Q_weight - S_Q) @ V_Q.T)[0]
@@ -510,7 +512,7 @@ def main():
                     prune.custom_from_mask(module.value_lora_s, 'weight', S_V)
         elif model_args.sparse_method == 'omp':
             for name, module in model.named_modules():
-                print(name)
+
                 if name.endswith("self") and name.startswith("bert"): # SelfAttention
                     Q_weight = module.query.weight
                     V_weight = module.value.weight
