@@ -288,6 +288,7 @@ class DebertaIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        # print(config.intermediate_size.shape)
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -537,11 +538,11 @@ class DisentangledSelfAttention(nn.Module):
 
         self.dropout = StableDropout(config.attention_probs_dropout_prob)
 
-    def add_factorization(self):
+    def add_factorization(self, _):
         assert self.apply_lora
         self.in_proj_weight = copy.deepcopy(self.in_proj.weight)
-        self.in_proj.weight.data[:self.all_head_size, :] = self.in_proj.weight.data[:self.all_head_size, :] + self.query_lora_b.weight.data@self.query_lora_a.weight.data
-        self.in_proj.weight.data[2*self.all_head_size:, :] = self.in_proj.weight.data[2*self.all_head_size:, :] + self.value_lora_b.weight.data@self.value_lora_a.weight.data
+        self.in_proj.weight.data[:self.all_head_size, :] = self.query_lora_b.weight.data@self.query_lora_a.weight.data + self.query_lora_s.weight_orig * self.query_lora_s.weight_mask
+        self.in_proj.weight.data[2*self.all_head_size:, :] = self.value_lora_b.weight.data@self.value_lora_a.weight.data + self.value_lora_s.weight_orig * self.value_lora_s.weight_mask
     
     def remove_factorization(self):
         self.in_proj.weight.copy_(self.in_proj_weight)

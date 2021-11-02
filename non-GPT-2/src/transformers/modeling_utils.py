@@ -2091,6 +2091,30 @@ def prune_linear_layer(layer: nn.Linear, index: torch.LongTensor, dim: int = 0) 
         new_layer.bias.requires_grad = True
     return new_layer
 
+import torch.nn.utils.prune as prune
+def prune_linear_layer_pruned(layer: nn.Linear, index: torch.LongTensor, dim: int = 0) -> nn.Linear:
+    mask = layer.weight_mask.to(layer.weight_orig.device)
+    index = index.to(layer.weight_orig.device)
+    W = layer.weight_orig.index_select(dim, index).clone().detach()
+    if layer.bias is not None:
+        if dim == 1:
+            b = layer.bias.clone().detach()
+        else:
+            b = layer.bias[index].clone().detach()
+    new_size = list(layer.weight_orig.size())
+    new_size[dim] = len(index)
+    new_layer = nn.Linear(new_size[1], new_size[0], bias=layer.bias is not None).to(layer.weight_orig.device)
+    new_layer.weight.requires_grad = False
+    new_layer.weight.copy_(W.contiguous())
+    new_layer.weight.requires_grad = True
+    if layer.bias is not None:
+        new_layer.bias.requires_grad = False
+        new_layer.bias.copy_(b.contiguous())
+        new_layer.bias.requires_grad = True
+    mask = mask.index_select(dim, index).clone().detach()
+    prune.custom_from_mask(new_layer, "weight", mask)
+    new_layer = new_layer.to(layer.weight_orig.device)
+    return new_layer
 
 def prune_conv1d_layer(layer: Conv1D, index: torch.LongTensor, dim: int = 1) -> Conv1D:
     """

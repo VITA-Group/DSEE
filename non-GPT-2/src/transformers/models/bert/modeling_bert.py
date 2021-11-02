@@ -53,6 +53,7 @@ from ...modeling_utils import (
     apply_chunking_to_forward,
     find_pruneable_heads_and_indices,
     prune_linear_layer,
+    prune_linear_layer_pruned,
 )
 from ...utils import logging
 from .configuration_bert import BertConfig
@@ -251,16 +252,13 @@ class BertSelfAttention(nn.Module):
 
             self.value_lora_a = nn.Linear(config.hidden_size, self.lora_r, bias=False)
             self.value_lora_b = nn.Linear(self.lora_r, self.all_head_size, bias=False)
+            # self.key_lora_a = nn.Linear(config.hidden_size, self.lora_r, bias=False)
+            # self.key_lora_b = nn.Linear(self.lora_r, self.all_head_size, bias=False)
         if config.apply_sparse:
             self.query_lora_s = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
             self.value_lora_s = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
+            # self.key_lora_s = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
         
-        self.slimming = config.slimming
-        if config.slimming:
-            self.slimming_coef = nn.Parameter(
-                torch.ones(self.num_attention_heads).reshape(1,-1,1,1) * 1.0
-            )
-
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
@@ -269,19 +267,42 @@ class BertSelfAttention(nn.Module):
 
         self.is_decoder = config.is_decoder
 
-    def add_factorization(self):
+    def add_factorization(self, mode):
         assert self.apply_lora
-        self.original_query_weight = copy.deepcopy(self.query.weight)
-        self.original_value_weight = copy.deepcopy(self.value.weight)
+        print(f"Pruning Mode: {mode}")
+        self.original_query_weight = self.query.weight.clone()
+        self.original_value_weight = self.value.weight.clone()
+        # print(self.original_query_weight.mean())
+        if mode == 'AB':
+            self.query.weight.data.copy_(self.query_lora_b.weight.data@self.query_lora_a.weight.data* (self.lora_alpha / self.lora_r))
+            self.value.weight.data.copy_(self.value_lora_b.weight.data@self.value_lora_a.weight.data* (self.lora_alpha / self.lora_r))
+        elif mode == 'ABS':
+            self.query.weight.data.copy_((self.query_lora_b.weight.data@self.query_lora_a.weight.data + self.query_lora_s.weight_orig * self.query_lora_s.weight_mask)* (self.lora_alpha / self.lora_r))
+            self.value.weight.data.copy_((self.value_lora_b.weight.data@self.value_lora_a.weight.data + self.value_lora_s.weight_orig * self.value_lora_s.weight_mask)* (self.lora_alpha / self.lora_r))
+        elif mode == 'NABS':
+            self.query.weight.data.copy_(1 / (self.query_lora_b.weight.data@self.query_lora_a.weight.data + self.query_lora_s.weight_orig * self.query_lora_s.weight_mask) / (self.lora_alpha / self.lora_r) )
+            self.value.weight.data.copy_(1 / (self.value_lora_b.weight.data@self.value_lora_a.weight.data + self.value_lora_s.weight_orig * self.value_lora_s.weight_mask) / (self.lora_alpha / self.lora_r))
+        elif mode == 'NAB':
+            self.query.weight.data.copy_(1 / (self.query_lora_b.weight.data@self.query_lora_a.weight.data))
+            self.value.weight.data.copy_(1 / (self.value_lora_b.weight.data@self.value_lora_a.weight.data))
+        elif mode == 'WABS':
+            self.query.weight.data.add_(self.query_lora_b.weight.data@self.query_lora_a.weight.data + self.query_lora_s.weight_orig * self.query_lora_s.weight_mask * (self.lora_alpha / self.lora_r))
+            self.value.weight.data.add_(self.value_lora_b.weight.data@self.value_lora_a.weight.data + self.value_lora_s.weight_orig * self.value_lora_s.weight_mask * (self.lora_alpha / self.lora_r))
+        elif mode == 'WAB':
+            self.query.weight.data.add_(self.query_lora_b.weight.data@self.query_lora_a.weight.data * (self.lora_alpha / self.lora_r))
+            self.value.weight.data.add_(self.value_lora_b.weight.data@self.value_lora_a.weight.data * (self.lora_alpha / self.lora_r))
+        elif mode == 'W':
+            pass
+        elif mode == 'random':
+            self.query.weight.data.copy_(torch.randn(self.query.weight.data.shape))
+            self.value.weight.data.copy_(torch.randn(self.value.weight.data.shape))
+        else:
+            raise NotImplementedError
 
-        self.query.weight.data.add_(self.query_lora_b.weight.data@self.query_lora_a.weight.data)
-        self.value.weight.data.add_(self.value_lora_b.weight.data@self.value_lora_a.weight.data)
-    
     def remove_factorization(self):
-        self.query.weight.data.copy_(self.original_query_weight)
-        self.value.weight.data.copy_(self.original_value_weight)
-        del self.original_query_weight
-        del self.original_value_weight
+
+        self.query.weight_orig.data.copy_(self.original_query_weight)
+        self.value.weight_orig.data.copy_(self.original_value_weight)
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -328,10 +349,12 @@ class BertSelfAttention(nn.Module):
         if self.apply_lora:
             query_layer = query_layer + self.transpose_for_scores(self.query_lora_b(self.query_lora_a(hidden_states)) * (self.lora_alpha / self.lora_r))
             value_layer = value_layer + self.transpose_for_scores(self.value_lora_b(self.value_lora_a(hidden_states)) * (self.lora_alpha / self.lora_r))
+            # key_layer = key_layer + self.transpose_for_scores(self.key_lora_b(self.key_lora_a(hidden_states)) * (self.lora_alpha / self.lora_r))
 
         if self.apply_sparse:
             query_layer = query_layer + self.transpose_for_scores(self.query_lora_s(hidden_states) * (self.lora_alpha / self.lora_r))
             value_layer = value_layer + self.transpose_for_scores(self.value_lora_s(hidden_states) * (self.lora_alpha / self.lora_r))
+            # key_layer = key_layer + self.transpose_for_scores(self.key_lora_s(hidden_states) * (self.lora_alpha / self.lora_r))
 
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
@@ -369,8 +392,6 @@ class BertSelfAttention(nn.Module):
 
         # Normalize the attention scores to probabilities.
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
-        if self.slimming:
-            attention_probs *= self.slimming_coef
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
         attention_probs = self.dropout(attention_probs)
@@ -412,7 +433,7 @@ class BertAttention(nn.Module):
         self.self = BertSelfAttention(config)
         self.output = BertSelfOutput(config)
         self.pruned_heads = set()
-
+        self.config = config
     def prune_heads(self, heads):
         if len(heads) == 0:
             return
@@ -425,7 +446,12 @@ class BertAttention(nn.Module):
         self.self.key = prune_linear_layer(self.self.key, index)
         self.self.value = prune_linear_layer(self.self.value, index)
         self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
-
+        if self.config.apply_lora:
+            self.self.query_lora_b = prune_linear_layer(self.self.query_lora_b, index)
+            self.self.value_lora_b = prune_linear_layer(self.self.value_lora_b, index)
+        if self.config.apply_sparse:
+            self.self.query_lora_s = prune_linear_layer_pruned(self.self.query_lora_s, index)
+            self.self.value_lora_s = prune_linear_layer_pruned(self.self.value_lora_s, index)
         # Update hyper params and store pruned heads
         self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
         self.self.all_head_size = self.self.attention_head_size * self.self.num_attention_heads
@@ -497,6 +523,40 @@ class BertLayer(nn.Module):
             self.crossattention = BertAttention(config)
         self.intermediate = BertIntermediate(config)
         self.output = BertOutput(config)
+        self.pruned_inter_neurons = set()
+        self.inter_slimming = False
+    def prune_inter_neurons(self, neurons):
+        if len(neurons) == 0:
+            return
+        mask = torch.ones(self.intermediate.dense.out_features)
+        # print(len(mask))
+        neurons = set(neurons) - self.pruned_inter_neurons  # Convert to set and remove already pruned neurons
+        # print(neurons)
+        if self.inter_slimming:
+            slimming_mask = torch.ones(self.intermediate.dense.out_features)
+        for neuron in neurons:
+            # Compute how many pruned neurons are before the neuron and move the index accordingly
+            neuron = neuron - sum(1 if n < neuron else 0 for n in self.pruned_inter_neurons)
+            mask[neuron] = 0
+            if self.inter_slimming:
+                slimming_mask[neuron] = 0
+        mask = mask.view(-1).contiguous().eq(1)
+        index = torch.arange(len(mask))[mask].long()
+        if self.inter_slimming:
+            slimming_mask = slimming_mask.view(-1).contiguous().eq(1)
+            slimming_index = torch.arange(len(slimming_mask))[slimming_mask].long()
+
+        # Prune linear layers
+        self.intermediate.dense = prune_linear_layer(self.intermediate.dense, index)
+        self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
+
+        # Update hyper params and store pruned neurons
+        self.pruned_inter_neurons = self.pruned_inter_neurons.union(neurons)
+        if self.inter_slimming:
+            slimming_index = slimming_index.to(self.slimming_coef.device)
+            new_data = self.slimming_coef.data.index_select(1, slimming_index).clone().detach()
+            with torch.no_grad():
+                self.slimming_coef = nn.Parameter(new_data)
 
     def forward(
         self,
@@ -778,12 +838,14 @@ class BertPreTrainedModel(PreTrainedModel):
             if module.apply_lora:
                 nn.init.normal_(module.query_lora_a.weight.data, std=0.02)
                 nn.init.normal_(module.value_lora_a.weight.data, std=0.02)
+                # nn.init.normal_(module.key_lora_a.weight.data, std=0.02)
                 module.query_lora_b.weight.data.zero_()
                 module.value_lora_b.weight.data.zero_()
+                # module.key_lora_b.weight.data.zero_()
             if module.apply_sparse:
                 module.query_lora_s.weight.data.zero_()
                 module.value_lora_s.weight.data.zero_()
-
+                # module.key_lora_s.weight.data.zero_()
 
 @dataclass
 class BertForPreTrainingOutput(ModelOutput):

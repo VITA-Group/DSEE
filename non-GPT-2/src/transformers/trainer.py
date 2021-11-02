@@ -2113,6 +2113,7 @@ class Trainer:
                 num_steps=math.ceil(output.num_samples / total_batch_size),
             )
         )
+        output.metrics.update([])
 
         self.log(output.metrics)
 
@@ -2257,6 +2258,7 @@ class Trainer:
         observed_num_examples = 0
         # Main evaluation loop
         for step, inputs in enumerate(dataloader):
+            # print(self.floating_point_ops(inputs))
             # Update the observed num examples
             observed_batch_size = find_batch_size(inputs)
             if observed_batch_size is not None:

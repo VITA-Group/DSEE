@@ -209,6 +209,10 @@ class ModelArguments:
         default=64
     )
 
+    prune_mode: Optional[str] = field(
+        default="WABS"
+    )
+
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
@@ -366,7 +370,7 @@ def main():
 
     if model_args.apply_lora:
         for name, param in model.named_parameters():
-            param.requires_grad = not ('lora' not in name and (name.startswith('bert') or name.startswith('deberta')))
+            param.requires_grad = not ('lora' not in name and (name.startswith('bert') or name.startswith('roberta') or name.startswith('deberta')))
 
             print(name, f"requires_grad: {param.requires_grad}")
         
@@ -503,39 +507,96 @@ def main():
     
     if model_args.apply_sparse:
         try:
-            checkpoint = torch.load(model_args.model_name_or_path, map_location="cpu")
-        except:
             checkpoint = torch.load(os.path.join(model_args.model_name_or_path, "pytorch_model.bin"), map_location="cpu")
+        except:
+            checkpoint = None
+            print("No checkpoint found!!")
         
-        for name, module in model.named_modules():
-            if name.endswith("self"):
-                prune.custom_from_mask(module.query_lora_s, 'weight', checkpoint[name + ".query_lora_s.weight_mask"])
-                
-                module.query_lora_s.weight_orig.data = checkpoint[name + ".query_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
-                prune.custom_from_mask(module.value_lora_s, 'weight', checkpoint[name + ".value_lora_s.weight_mask"])
+        if checkpoint is not None:
+            print("Loading from checkpoint for sparsification...")
+            for name, module in model.named_modules():
+                if name.endswith("self"):
+                    prune.custom_from_mask(module.query_lora_s, 'weight', checkpoint[name + ".query_lora_s.weight_mask"])
+                    
+                    module.query_lora_s.weight_orig.data = checkpoint[name + ".query_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
+                    prune.custom_from_mask(module.value_lora_s, 'weight', checkpoint[name + ".value_lora_s.weight_mask"])
 
-                module.value_lora_s.weight_orig.data = checkpoint[name + ".value_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
-                
-    if model_args.apply_lora:
-        if model_args.lora_path is not None:
-            lora_state_dict = torch.load(model_args.lora_path, map_location="cpu")
-            logger.info(f"Apply LoRA state dict from {model_args.lora_path}.")
-            logger.info(lora_state_dict.keys())
-            model.load_state_dict(lora_state_dict)
+                    module.value_lora_s.weight_orig.data = checkpoint[name + ".value_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
+        else:
+            for name, module in model.named_modules():
+                print(name)
+                if name.endswith("self") and name.startswith("bert"): # SelfAttention
+                    Q_weight = module.query.weight
+                    V_weight = module.value.weight
+                    Q_weight = Q_weight.detach()
+                    V_weight = V_weight.detach()
+                    U_Q = torch.randn((Q_weight.shape[0], 1)).to(Q_weight.device)
+                    V_Q = torch.randn((1, Q_weight.shape[1])).to(Q_weight.device)
+                    S_Q = torch.zeros_like(Q_weight)
+
+                    U_V = torch.randn((V_weight.shape[0], 1)).to(V_weight.device)
+                    V_V = torch.randn((1, V_weight.shape[1])).to(V_weight.device)
+                    S_V = torch.zeros_like(V_weight)
+                    last_S_Q = torch.zeros_like(Q_weight)
+
+                    for rank in range(100):
+                        S_Q = torch.zeros_like(Q_weight)
+                        S_V = torch.zeros_like(Q_weight)
+                        for _ in range(2):
+                            #print(_, residual_change)
+                            U_Q = torch.qr((Q_weight - S_Q) @ V_Q.T)[0]
+                            V_Q = U_Q.T @ (Q_weight - S_Q)
+                            S_Q = Q_weight - U_Q @ V_Q
+                            q = 0.01
+                            S_Q[S_Q.abs() < q] = 0
+                            residual = torch.norm(Q_weight - U_Q@V_Q).item()
+                            last_S_Q = S_Q
+                            
+                            U_V = torch.qr((V_weight - S_V) @ V_V.T)[0]
+                            V_V = U_V.T @ (V_weight - S_V)
+                            S_V = V_weight - U_V @ V_V
+                            #residual_change.append(torch.norm(Q_weight - U_V@V_V).item())
+                            q = 0.01
+                            S_V[S_V.abs() < q] = 0
+
+                        E_Q = Q_weight - U_Q @ V_Q - S_Q
+                        E_V = V_weight - U_V @ V_V - S_V
+                        
+                        E_Q_vector = torch.qr(E_Q)[1][:5]
+                        E_V_vector = torch.qr(E_V)[1][:5]
+                        
+                        V_Q = torch.cat([V_Q, E_Q_vector], 0)
+                        V_V = torch.cat([V_V, E_V_vector], 0)
+                    
+                    q, _ = torch.kthvalue(S_Q.abs().view(-1), S_Q.numel() - model_args.num_sparse + 1)
+                    S_Q = (S_Q.abs() >= q).float().cuda()
+                    #print(S_Q)
+                    v, _ = torch.kthvalue(S_V.abs().view(-1), S_V.numel() - model_args.num_sparse + 1)
+                    S_V = (S_V.abs() >= v).float().cuda()
+                    torch.distributed.broadcast(S_Q, 0)
+                    torch.distributed.barrier()
+                    torch.distributed.broadcast(S_V, 0)
+                    torch.distributed.barrier()
+                    # print((S_Q!=0).sum())
+                    # print(S_Q.sum(1))
+                    prune.custom_from_mask(module.query_lora_s, 'weight', S_Q.cpu())
+                    prune.custom_from_mask(module.value_lora_s, 'weight', S_V.cpu())
+                    print(residual)
 
     if model_args.apply_lora:
         for name, m in model.named_modules():
             if 'self' in name and name.endswith('self'):
-                m.add_factorization()
+                m.add_factorization(mode=model_args.prune_mode)
                     
     
-    def pruning_model(model, px):
+    def pruning_model_with(model, px, names):
 
         print('start unstructured pruning for all linear layers')
         parameters_to_prune =[]
         for name, m in model.named_modules():
             if ('lora' not in name):
-                if 'query' in name or 'key' in name or 'value' in name or 'dense' in name or 'in_proj' in name:
+                flags = [m in name for m in names]
+                if any(flags):
                     print(f"prune {name}")
                     parameters_to_prune.append((m, "weight"))
 
@@ -549,7 +610,10 @@ def main():
         )
     
     # prune 
-    pruning_model(model, training_args.pruning_ratio)
+    if training_args.pruning_ratio > 0:
+        pruning_model_with(model, training_args.pruning_ratio, ['key', 'dense', 'in_proj'])
+    if training_args.ad_pruning_ratio > 0:
+        pruning_model_with(model, training_args.ad_pruning_ratio, ['query', 'value'])
 
     if model_args.apply_lora:
         for name, m in model.named_modules():
@@ -559,7 +623,7 @@ def main():
 
     if model_args.apply_lora:
         for name, param in model.named_parameters():
-            param.requires_grad = not ('lora' not in name and (name.startswith('bert') or name.startswith('deberta')))
+            param.requires_grad = not ('lora' not in name and (name.startswith('bert') or name.startswith('roberta') or name.startswith('deberta')))
             print(name, f"requires_grad: {param.requires_grad}")
 
     def check_sparsity(model, conv1=True):
@@ -569,7 +633,7 @@ def main():
 
         state_dict = model.state_dict()
         for name in state_dict:
-            if 'orig' in name:
+            if 'orig' in name and 'lora' not in name:
                 sum_list = sum_list+float(state_dict[name].numel())
                 zero_sum = zero_sum+float(torch.sum((state_dict[name[:-5] + "_mask"] * state_dict[name]) == 0))  
         print("* zero:", zero_sum)
@@ -577,6 +641,12 @@ def main():
         
         print('* remain weight = ', 100*(1-zero_sum/sum_list),'%')
         
+        state_dict = model.state_dict()
+        for key in state_dict:
+            if 'weight_mask' in key:
+                param = state_dict[key]
+                print(key, param.data.sum() / param.data.numel())
+
         return 100*(1-zero_sum/sum_list)
 
     check_sparsity(model)

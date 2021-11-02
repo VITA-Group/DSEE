@@ -17,7 +17,6 @@
 # You can also adapt this script on your own text classification task. Pointers for this are left as comments.
 
 import logging
-import torch
 import os
 import random
 import sys
@@ -27,7 +26,8 @@ from typing import Optional
 import datasets
 import numpy as np
 from datasets import load_dataset, load_metric
-
+import torch
+import torch.nn.utils.prune as prune
 import transformers
 from transformers import (
     AutoConfig,
@@ -46,7 +46,6 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
-import torch.nn.utils.prune as prune
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.11.0.dev0")
@@ -67,6 +66,25 @@ task_to_keys = {
 
 logger = logging.getLogger(__name__)
 
+def pruning_model(model,px):
+
+    parameters_to_prune =[]
+    for ii in range(12):
+        parameters_to_prune.append((model.bert.encoder.layer[ii].attention.self.query, 'weight'))
+        parameters_to_prune.append((model.bert.encoder.layer[ii].attention.self.key, 'weight'))
+        parameters_to_prune.append((model.bert.encoder.layer[ii].attention.self.value, 'weight'))
+        parameters_to_prune.append((model.bert.encoder.layer[ii].attention.output.dense, 'weight'))
+        parameters_to_prune.append((model.bert.encoder.layer[ii].intermediate.dense, 'weight'))
+        parameters_to_prune.append((model.bert.encoder.layer[ii].output.dense, 'weight'))
+
+    parameters_to_prune.append((model.bert.pooler.dense, 'weight'))
+    parameters_to_prune = tuple(parameters_to_prune)
+
+    prune.global_unstructured(
+        parameters_to_prune,
+        pruning_method=prune.RandomUnstructured,
+        amount=px,
+    )
 
 @dataclass
 class DataTrainingArguments:
@@ -133,7 +151,7 @@ class DataTrainingArguments:
         default=None, metadata={"help": "A csv or a json file containing the validation data."}
     )
     test_file: Optional[str] = field(default=None, metadata={"help": "A csv or a json file containing the test data."})
-    
+
     def __post_init__(self):
         if self.task_name is not None:
             self.task_name = self.task_name.lower()
@@ -186,11 +204,11 @@ class ModelArguments:
             "with private models)."
         }
     )
-
-    apply_sparse: Optional[bool] = field(
+    
+    apply_lora: Optional[bool] = field(
         default=False
     )
-    apply_lora: Optional[bool] = field(
+    apply_sparse: Optional[bool] = field(
         default=False
     )
     lora_r: Optional[int] = field(
@@ -199,14 +217,20 @@ class ModelArguments:
     lora_alpha: Optional[int] = field(
         default=32
     )
-    lora_path: Optional[str] = field(
-        default=None
-    )
-    cls_dropout: Optional[float] = field(
-        default=0.0
-    )
     num_sparse: Optional[int] = field(
-        default=64
+        default=128
+    )
+
+    sparse_method: Optional[str] = field(
+        default="grebsmo"
+    )
+
+    slimming: bool = field(
+        default=False
+    )
+
+    cls_dropout: Optional[float] = field(
+        default=None
     )
 
 def main():
@@ -362,15 +386,7 @@ def main():
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
-    )
-
-    if model_args.apply_lora:
-        for name, param in model.named_parameters():
-            param.requires_grad = not ('lora' not in name and (name.startswith('bert') or name.startswith('deberta')))
-
-            print(name, f"requires_grad: {param.requires_grad}")
-        
-
+    )            
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
@@ -446,12 +462,6 @@ def main():
             load_from_cache_file=not data_args.overwrite_cache,
             desc="Running tokenizer on dataset",
         )
-    if training_args.do_train:
-        if "train" not in raw_datasets:
-            raise ValueError("--do_train requires a train dataset")
-        train_dataset = raw_datasets["train"]
-        if data_args.max_train_samples is not None:
-            train_dataset = train_dataset.select(range(data_args.max_train_samples))
 
     if training_args.do_eval:
         if "validation" not in raw_datasets and "validation_matched" not in raw_datasets:
@@ -468,9 +478,6 @@ def main():
             predict_dataset = predict_dataset.select(range(data_args.max_predict_samples))
 
     # Log a few random samples from the training set:
-    if training_args.do_train:
-        for index in random.sample(range(len(train_dataset)), 3):
-            logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
     # Get the metric function
     if data_args.task_name is not None:
@@ -500,117 +507,20 @@ def main():
         data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
     else:
         data_collator = None
-    
-    if model_args.apply_sparse:
-        try:
-            checkpoint = torch.load(model_args.model_name_or_path, map_location="cpu")
-        except:
-            checkpoint = torch.load(os.path.join(model_args.model_name_or_path, "pytorch_model.bin"), map_location="cpu")
-        
-        for name, module in model.named_modules():
-            if name.endswith("self"):
-                prune.custom_from_mask(module.query_lora_s, 'weight', checkpoint[name + ".query_lora_s.weight_mask"])
-                
-                module.query_lora_s.weight_orig.data = checkpoint[name + ".query_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
-                prune.custom_from_mask(module.value_lora_s, 'weight', checkpoint[name + ".value_lora_s.weight_mask"])
 
-                module.value_lora_s.weight_orig.data = checkpoint[name + ".value_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
-                
-    if model_args.apply_lora:
-        if model_args.lora_path is not None:
-            lora_state_dict = torch.load(model_args.lora_path, map_location="cpu")
-            logger.info(f"Apply LoRA state dict from {model_args.lora_path}.")
-            logger.info(lora_state_dict.keys())
-            model.load_state_dict(lora_state_dict)
-
-    if model_args.apply_lora:
-        for name, m in model.named_modules():
-            if 'self' in name and name.endswith('self'):
-                m.add_factorization()
-                    
-    
-    def pruning_model(model, px):
-
-        print('start unstructured pruning for all linear layers')
-        parameters_to_prune =[]
-        for name, m in model.named_modules():
-            if ('lora' not in name):
-                if 'query' in name or 'key' in name or 'value' in name or 'dense' in name or 'in_proj' in name:
-                    print(f"prune {name}")
-                    parameters_to_prune.append((m, "weight"))
-
-
-        parameters_to_prune = tuple(parameters_to_prune)
-
-        prune.global_unstructured(
-            parameters_to_prune,
-            pruning_method=prune.L1Unstructured,
-            amount=px,
-        )
-    
-    # prune 
-    pruning_model(model, training_args.pruning_ratio)
-
-    if model_args.apply_lora:
-        for name, m in model.named_modules():
-            if 'self' in name and name.endswith('self'):
-                m.remove_factorization()
-                    
-
-    if model_args.apply_lora:
-        for name, param in model.named_parameters():
-            param.requires_grad = not ('lora' not in name and (name.startswith('bert') or name.startswith('deberta')))
-            print(name, f"requires_grad: {param.requires_grad}")
-
-    def check_sparsity(model, conv1=True):
-    
-        sum_list = 0
-        zero_sum = 0
-
-        state_dict = model.state_dict()
-        for name in state_dict:
-            if 'orig' in name:
-                sum_list = sum_list+float(state_dict[name].numel())
-                zero_sum = zero_sum+float(torch.sum((state_dict[name[:-5] + "_mask"] * state_dict[name]) == 0))  
-        print("* zero:", zero_sum)
-        print("* all:", sum_list)
-        
-        print('* remain weight = ', 100*(1-zero_sum/sum_list),'%')
-        
-        return 100*(1-zero_sum/sum_list)
-
-    check_sparsity(model)
-            
     # Initialize our Trainer
+    if training_args.pruning_ratio > 0:
+        pruning_model(model, training_args.pruning_ratio)
+
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
+        train_dataset=None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         compute_metrics=compute_metrics,
         tokenizer=tokenizer,
         data_collator=data_collator,
     )
-
-    # Training
-    if training_args.do_train:
-        checkpoint = None
-        if training_args.resume_from_checkpoint is not None:
-            checkpoint = training_args.resume_from_checkpoint
-        elif last_checkpoint is not None:
-            checkpoint = last_checkpoint
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        metrics = train_result.metrics
-        max_train_samples = (
-            data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
-        )
-        metrics["train_samples"] = min(max_train_samples, len(train_dataset))
-
-        trainer.save_model()  # Saves the tokenizer too for easy upload
-
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-        trainer.save_state()
 
     # Evaluation
     if training_args.do_eval:

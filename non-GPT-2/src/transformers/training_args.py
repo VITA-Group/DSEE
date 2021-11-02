@@ -664,7 +664,9 @@ class TrainingArguments:
         metadata={"help": "Used by the SageMaker launcher to send mp-specific args. Ignored in Trainer"},
     )
 
-    pruning_ratio: Optional[float] = field(default=0.1)
+    pruning_ratio: Optional[float] = field(default=0.0)
+    ad_pruning_ratio: Optional[float] = field(default=0.0)
+
     l1_loss_coef: Optional[float] = field(
         default=0.0, metadata={'help': 'coefficient for the l1 loss of network slimming'}
     )

@@ -17,7 +17,6 @@
 # You can also adapt this script on your own text classification task. Pointers for this are left as comments.
 
 import logging
-import torch
 import os
 import random
 import sys
@@ -27,7 +26,8 @@ from typing import Optional
 import datasets
 import numpy as np
 from datasets import load_dataset, load_metric
-
+import torch
+import torch.nn.utils.prune as prune
 import transformers
 from transformers import (
     AutoConfig,
@@ -46,7 +46,7 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
-import torch.nn.utils.prune as prune
+from transformers.models.bert.modeling_bert import BertSelfAttention, BertLayer, BertAttention
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.11.0.dev0")
@@ -133,7 +133,7 @@ class DataTrainingArguments:
         default=None, metadata={"help": "A csv or a json file containing the validation data."}
     )
     test_file: Optional[str] = field(default=None, metadata={"help": "A csv or a json file containing the test data."})
-    
+
     def __post_init__(self):
         if self.task_name is not None:
             self.task_name = self.task_name.lower()
@@ -187,26 +187,40 @@ class ModelArguments:
         }
     )
 
-    apply_sparse: Optional[bool] = field(
+    
+    apply_lora: Optional[bool] = field(
         default=False
     )
-    apply_lora: Optional[bool] = field(
+    apply_sparse: Optional[bool] = field(
         default=False
     )
     lora_r: Optional[int] = field(
         default=4
     )
-    lora_alpha: Optional[int] = field(
-        default=32
-    )
     lora_path: Optional[str] = field(
         default=None
     )
-    cls_dropout: Optional[float] = field(
-        default=0.0
+    lora_alpha: Optional[int] = field(
+        default=32
     )
     num_sparse: Optional[int] = field(
-        default=64
+        default=128
+    )
+
+    sparse_method: Optional[str] = field(
+        default="grebsmo"
+    )
+
+    prune_mode: Optional[str] = field(
+        default="WABS"
+    )
+
+    prune_heads_num: Optional[int] = field(
+        default=3
+    )
+
+    cls_dropout: float = field(
+        default=0.0
     )
 
 def main():
@@ -345,9 +359,10 @@ def main():
         apply_sparse=model_args.apply_sparse,
         lora_alpha=model_args.lora_alpha,
         lora_r=model_args.lora_r,
+        cls_dropout=model_args.cls_dropout,
         use_auth_token=True if model_args.use_auth_token else None,
-        cls_dropout = model_args.cls_dropout
     )
+
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
@@ -363,14 +378,24 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+    import copy
+    if training_args.load_from_pruned:
+        new_config = copy.deepcopy(config)
+        new_config.self_pruning_ratio = training_args.self_pruning_ratio
+        new_config.inter_pruning_ratio = training_args.inter_pruning_ratio
+    else:
+        new_config = config
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_args.model_name_or_path,
+        from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        config=new_config,
+        cache_dir=model_args.cache_dir,
+    )
 
     if model_args.apply_lora:
         for name, param in model.named_parameters():
-            param.requires_grad = not ('lora' not in name and (name.startswith('bert') or name.startswith('deberta')))
-
-            print(name, f"requires_grad: {param.requires_grad}")
-        
-
+            param.requires_grad = (not ('lora' not in name and (name.startswith('bert') or name.startswith('deberta')))) or 'coef' in name
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
@@ -500,87 +525,86 @@ def main():
         data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
     else:
         data_collator = None
-    
+
+
     if model_args.apply_sparse:
         try:
-            checkpoint = torch.load(model_args.model_name_or_path, map_location="cpu")
-        except:
             checkpoint = torch.load(os.path.join(model_args.model_name_or_path, "pytorch_model.bin"), map_location="cpu")
+        except:
+            checkpoint = None
+            print("No checkpoint found!!")
         
-        for name, module in model.named_modules():
-            if name.endswith("self"):
-                prune.custom_from_mask(module.query_lora_s, 'weight', checkpoint[name + ".query_lora_s.weight_mask"])
-                
-                module.query_lora_s.weight_orig.data = checkpoint[name + ".query_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
-                prune.custom_from_mask(module.value_lora_s, 'weight', checkpoint[name + ".value_lora_s.weight_mask"])
-
-                module.value_lora_s.weight_orig.data = checkpoint[name + ".value_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
-                
-    if model_args.apply_lora:
-        if model_args.lora_path is not None:
-            lora_state_dict = torch.load(model_args.lora_path, map_location="cpu")
-            logger.info(f"Apply LoRA state dict from {model_args.lora_path}.")
-            logger.info(lora_state_dict.keys())
-            model.load_state_dict(lora_state_dict)
-
-    if model_args.apply_lora:
-        for name, m in model.named_modules():
-            if 'self' in name and name.endswith('self'):
-                m.add_factorization()
+        if checkpoint is not None:
+            print("Loading from checkpoint for sparsification...")
+            for name, module in model.named_modules():
+                if name.endswith("self"):
+                    prune.custom_from_mask(module.query_lora_s, 'weight', checkpoint[name + ".query_lora_s.weight_mask"])
                     
-    
-    def pruning_model(model, px):
+                    module.query_lora_s.weight_orig.data = checkpoint[name + ".query_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
+                    prune.custom_from_mask(module.value_lora_s, 'weight', checkpoint[name + ".value_lora_s.weight_mask"])
 
-        print('start unstructured pruning for all linear layers')
-        parameters_to_prune =[]
-        for name, m in model.named_modules():
-            if ('lora' not in name):
-                if 'query' in name or 'key' in name or 'value' in name or 'dense' in name or 'in_proj' in name:
-                    print(f"prune {name}")
-                    parameters_to_prune.append((m, "weight"))
+                    module.value_lora_s.weight_orig.data = checkpoint[name + ".value_lora_s.weight_orig"].to(module.query_lora_s.weight_orig.data.device)
+        else:
+            for name, module in model.named_modules():
+                print(name)
+                if name.endswith("self") and name.startswith("bert"): # SelfAttention
+                    Q_weight = module.query.weight
+                    V_weight = module.value.weight
+                    Q_weight = Q_weight.detach()
+                    V_weight = V_weight.detach()
+                    U_Q = torch.randn((Q_weight.shape[0], 1)).to(Q_weight.device)
+                    V_Q = torch.randn((1, Q_weight.shape[1])).to(Q_weight.device)
+                    S_Q = torch.zeros_like(Q_weight)
 
+                    U_V = torch.randn((V_weight.shape[0], 1)).to(V_weight.device)
+                    V_V = torch.randn((1, V_weight.shape[1])).to(V_weight.device)
+                    S_V = torch.zeros_like(V_weight)
+                    last_S_Q = torch.zeros_like(Q_weight)
 
-        parameters_to_prune = tuple(parameters_to_prune)
+                    for rank in range(1):
+                        S_Q = torch.zeros_like(Q_weight)
+                        S_V = torch.zeros_like(Q_weight)
+                        for _ in range(2):
+                            #print(_, residual_change)
+                            U_Q = torch.qr((Q_weight - S_Q) @ V_Q.T)[0]
+                            V_Q = U_Q.T @ (Q_weight - S_Q)
+                            S_Q = Q_weight - U_Q @ V_Q
+                            q = 0.01
+                            S_Q[S_Q.abs() < q] = 0
+                            residual = torch.norm(Q_weight - U_Q@V_Q).item()
+                            last_S_Q = S_Q
+                            
+                            U_V = torch.qr((V_weight - S_V) @ V_V.T)[0]
+                            V_V = U_V.T @ (V_weight - S_V)
+                            S_V = V_weight - U_V @ V_V
+                            #residual_change.append(torch.norm(Q_weight - U_V@V_V).item())
+                            q = 0.01
+                            S_V[S_V.abs() < q] = 0
 
-        prune.global_unstructured(
-            parameters_to_prune,
-            pruning_method=prune.L1Unstructured,
-            amount=px,
-        )
-    
-    # prune 
-    pruning_model(model, training_args.pruning_ratio)
-
-    if model_args.apply_lora:
-        for name, m in model.named_modules():
-            if 'self' in name and name.endswith('self'):
-                m.remove_factorization()
+                        E_Q = Q_weight - U_Q @ V_Q - S_Q
+                        E_V = V_weight - U_V @ V_V - S_V
+                        
+                        E_Q_vector = torch.qr(E_Q)[1][:5]
+                        E_V_vector = torch.qr(E_V)[1][:5]
+                        
+                        V_Q = torch.cat([V_Q, E_Q_vector], 0)
+                        V_V = torch.cat([V_V, E_V_vector], 0)
                     
+                    q, _ = torch.kthvalue(S_Q.abs().view(-1), S_Q.numel() - model_args.num_sparse + 1)
+                    S_Q = (S_Q.abs() >= q).float().cuda()
+                    #print(S_Q)
+                    v, _ = torch.kthvalue(S_V.abs().view(-1), S_V.numel() - model_args.num_sparse + 1)
+                    S_V = (S_V.abs() >= v).float().cuda()
+                    torch.distributed.broadcast(S_Q, 0)
+                    torch.distributed.barrier()
+                    torch.distributed.broadcast(S_V, 0)
+                    torch.distributed.barrier()
+                    # print((S_Q!=0).sum())
+                    # print(S_Q.sum(1))
+                    prune.custom_from_mask(module.query_lora_s, 'weight', S_Q.cpu())
+                    prune.custom_from_mask(module.value_lora_s, 'weight', S_V.cpu())
+                    print(residual)
 
-    if model_args.apply_lora:
-        for name, param in model.named_parameters():
-            param.requires_grad = not ('lora' not in name and (name.startswith('bert') or name.startswith('deberta')))
-            print(name, f"requires_grad: {param.requires_grad}")
-
-    def check_sparsity(model, conv1=True):
-    
-        sum_list = 0
-        zero_sum = 0
-
-        state_dict = model.state_dict()
-        for name in state_dict:
-            if 'orig' in name:
-                sum_list = sum_list+float(state_dict[name].numel())
-                zero_sum = zero_sum+float(torch.sum((state_dict[name[:-5] + "_mask"] * state_dict[name]) == 0))  
-        print("* zero:", zero_sum)
-        print("* all:", sum_list)
-        
-        print('* remain weight = ', 100*(1-zero_sum/sum_list),'%')
-        
-        return 100*(1-zero_sum/sum_list)
-
-    check_sparsity(model)
-            
     # Initialize our Trainer
     trainer = Trainer(
         model=model,
@@ -593,12 +617,56 @@ def main():
     )
 
     # Training
+    
+        
+    if True:        
+        bert_layers = []
+        for m in model.modules():
+            if isinstance(m, BertLayer):
+                bert_layers.append(m)
+        attention_modules = []
+        for m in model.modules():
+            if isinstance(m, BertAttention):
+                attention_modules.append(m)
+
+        for m in attention_modules:
+            if model_args.prune_mode == 'ABS':
+                l = torch.chunk(torch.sum((m.self.query_lora_b.weight.data@m.self.query_lora_a.weight.data + m.self.query_lora_s.weight_orig*m.self.query_lora_s.weight_mask).abs() + (m.self.value_lora_b.weight.data@m.self.value_lora_a.weight.data + m.self.value_lora_s.weight_orig*m.self.value_lora_s.weight_mask).abs(), 1), 12)
+                l = torch.stack([torch.sum(ll) for ll in l])
+            elif model_args.prune_mode == 'WABS':
+                l = torch.chunk(torch.sum((m.self.query_lora_b.weight.data@m.self.query_lora_a.weight.data + m.self.query_lora_s.weight_orig*m.self.query_lora_s.weight_mask).abs() + (m.self.value_lora_b.weight.data@m.self.value_lora_a.weight.data + m.self.value_lora_s.weight_orig*m.self.value_lora_s.weight_mask).abs() + m.self.query.weight.abs() + m.self.value.weight.abs(), 1), 12)
+                l = torch.stack([torch.sum(ll) for ll in l])
+            elif model_args.prune_mode == 'random':
+                l = torch.randn(12)
+            pruned_heads = torch.argsort(l)[:model_args.prune_heads_num]
+            # pruned_heads = a[:3]
+            logger.info('pruned heads: {}'.format(str(pruned_heads)))
+            m.prune_heads(pruned_heads)
+    
+        if model_args.apply_lora:
+            for name, param in model.named_parameters():
+                param.requires_grad = ((not ('lora' not in name and (name.startswith('bert') or name.startswith('deberta')))) or 'coef' in name)
+
+        trainable = 0
+        if training_args.local_rank == 0:
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    trainable += param.data.numel()
+                print(name, param.requires_grad)
+        
+            print(f"Trainable: {trainable}")
     if training_args.do_train:
+        
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
+        
+        if model_args.apply_sparse:
+            import time
+            start = time.time()
+
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         metrics = train_result.metrics
         max_train_samples = (
@@ -607,7 +675,7 @@ def main():
         metrics["train_samples"] = min(max_train_samples, len(train_dataset))
 
         trainer.save_model()  # Saves the tokenizer too for easy upload
-
+        
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()

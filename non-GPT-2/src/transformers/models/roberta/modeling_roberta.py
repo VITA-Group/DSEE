@@ -175,6 +175,19 @@ class RobertaSelfAttention(nn.Module):
         self.key = nn.Linear(config.hidden_size, self.all_head_size)
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
+        self.apply_lora = config.apply_lora
+        self.apply_sparse = config.apply_sparse
+        if config.apply_lora:
+            self.lora_r = config.lora_r
+            self.lora_alpha = config.lora_alpha
+            self.query_lora_a = nn.Linear(config.hidden_size, self.lora_r, bias=False)
+            self.query_lora_b = nn.Linear(self.lora_r, self.all_head_size, bias=False)
+            self.value_lora_a = nn.Linear(config.hidden_size, self.lora_r, bias=False)
+            self.value_lora_b = nn.Linear(self.lora_r, self.all_head_size, bias=False)
+        if config.apply_sparse:
+            self.query_lora_s = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
+            self.value_lora_s = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
+
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
@@ -182,6 +195,43 @@ class RobertaSelfAttention(nn.Module):
             self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
         self.is_decoder = config.is_decoder
+
+    def add_factorization(self, mode):
+        assert self.apply_lora
+        print(f"Pruning Mode: {mode}")
+        self.original_query_weight = self.query.weight.clone()
+        self.original_value_weight = self.value.weight.clone()
+        # print(self.original_query_weight.mean())
+        if mode == 'AB':
+            self.query.weight.data.copy_(self.query_lora_b.weight.data@self.query_lora_a.weight.data* (self.lora_alpha / self.lora_r))
+            self.value.weight.data.copy_(self.value_lora_b.weight.data@self.value_lora_a.weight.data* (self.lora_alpha / self.lora_r))
+        elif mode == 'ABS':
+            self.query.weight.data.copy_((self.query_lora_b.weight.data@self.query_lora_a.weight.data + self.query_lora_s.weight_orig * self.query_lora_s.weight_mask)* (self.lora_alpha / self.lora_r))
+            self.value.weight.data.copy_((self.value_lora_b.weight.data@self.value_lora_a.weight.data + self.value_lora_s.weight_orig * self.value_lora_s.weight_mask)* (self.lora_alpha / self.lora_r))
+        elif mode == 'NABS':
+            self.query.weight.data.copy_(1 / (self.query_lora_b.weight.data@self.query_lora_a.weight.data + self.query_lora_s.weight_orig * self.query_lora_s.weight_mask) / (self.lora_alpha / self.lora_r) )
+            self.value.weight.data.copy_(1 / (self.value_lora_b.weight.data@self.value_lora_a.weight.data + self.value_lora_s.weight_orig * self.value_lora_s.weight_mask) / (self.lora_alpha / self.lora_r))
+        elif mode == 'NAB':
+            self.query.weight.data.copy_(1 / (self.query_lora_b.weight.data@self.query_lora_a.weight.data))
+            self.value.weight.data.copy_(1 / (self.value_lora_b.weight.data@self.value_lora_a.weight.data))
+        elif mode == 'WABS':
+            self.query.weight.data.add_(self.query_lora_b.weight.data@self.query_lora_a.weight.data + self.query_lora_s.weight_orig * self.query_lora_s.weight_mask * (self.lora_alpha / self.lora_r))
+            self.value.weight.data.add_(self.value_lora_b.weight.data@self.value_lora_a.weight.data + self.value_lora_s.weight_orig * self.value_lora_s.weight_mask * (self.lora_alpha / self.lora_r))
+        elif mode == 'WAB':
+            self.query.weight.data.add_(self.query_lora_b.weight.data@self.query_lora_a.weight.data * (self.lora_alpha / self.lora_r))
+            self.value.weight.data.add_(self.value_lora_b.weight.data@self.value_lora_a.weight.data * (self.lora_alpha / self.lora_r))
+        elif mode == 'W':
+            pass
+        elif mode == 'random':
+            self.query.weight.data.copy_(torch.randn(self.query.weight.data.shape))
+            self.value.weight.data.copy_(torch.randn(self.value.weight.data.shape))
+        else:
+            raise NotImplementedError
+
+    def remove_factorization(self):
+
+        self.query.weight_orig.data.copy_(self.original_query_weight)
+        self.value.weight_orig.data.copy_(self.original_value_weight)
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -224,6 +274,16 @@ class RobertaSelfAttention(nn.Module):
             value_layer = self.transpose_for_scores(self.value(hidden_states))
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
+
+        if self.apply_lora:
+            query_layer = query_layer + self.transpose_for_scores(self.query_lora_b(self.query_lora_a(hidden_states)) * (self.lora_alpha / self.lora_r))
+            value_layer = value_layer + self.transpose_for_scores(self.value_lora_b(self.value_lora_a(hidden_states)) * (self.lora_alpha / self.lora_r))
+            # key_layer = key_layer + self.transpose_for_scores(self.key_lora_b(self.key_lora_a(hidden_states)) * (self.lora_alpha / self.lora_r))
+
+        if self.apply_sparse:
+            query_layer = query_layer + self.transpose_for_scores(self.query_lora_s(hidden_states) * (self.lora_alpha / self.lora_r))
+            value_layer = value_layer + self.transpose_for_scores(self.value_lora_s(hidden_states) * (self.lora_alpha / self.lora_r))
+            # key_layer = key_layer + self.transpose_for_scores(self.key_lora_s(hidden_states) * (self.lora_alpha / self.lora_r))
 
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
@@ -602,6 +662,19 @@ class RobertaPreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
+        elif isinstance(module, RobertaSelfAttention):
+            if module.apply_lora:
+                nn.init.normal_(module.query_lora_a.weight.data, std=0.02)
+                nn.init.normal_(module.value_lora_a.weight.data, std=0.02)
+                # nn.init.normal_(module.key_lora_a.weight.data, std=0.02)
+                module.query_lora_b.weight.data.zero_()
+                module.value_lora_b.weight.data.zero_()
+                # module.key_lora_b.weight.data.zero_()
+            if module.apply_sparse:
+                module.query_lora_s.weight.data.zero_()
+                module.value_lora_s.weight.data.zero_()
+                # module.key_lora_s.weight.data.zero_()
+
 
     def update_keys_to_ignore(self, config, del_keys_to_ignore):
         """Remove some keys from ignore list"""

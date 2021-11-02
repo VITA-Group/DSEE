@@ -372,8 +372,7 @@ def main():
     trainable = 0
     if model_args.apply_lora:
         for name, param in model.named_parameters():
-            param.requires_grad = ((not ('lora' not in name and (name.startswith('bert') or name.startswith('deberta')))) or 'coef' in name)
-            
+            param.requires_grad = ((not ('lora' not in name and (name.startswith('bert') or name.startswith('roberta') or name.startswith('deberta')))) or 'coef' in name)
 
     if training_args.local_rank == 0:
         for name, param in model.named_parameters():
@@ -384,34 +383,54 @@ def main():
         print(f"Trainable: {trainable}")
 
     if model_args.apply_sparse:
+        import time
+        start = time.time()
+        
         if model_args.sparse_method == 'grebsmo':
             for name, module in model.named_modules():
                 print(name)
                 if name.endswith("self") and name.startswith("bert"): # SelfAttention
+
+                    if model_args.num_sparse == 0:
+                        prune.custom_from_mask(module.query_lora_s, 'weight', torch.zeros_like(module.query_lora_s.weight).cpu())
+                        prune.custom_from_mask(module.value_lora_s, 'weight', torch.zeros_like(module.value_lora_s.weight).cpu())
+                        continue
+
+
+                if name.endswith("self") and (name.startswith("bert") or name.startswith("roberta")): # SelfAttention
                     Q_weight = module.query.weight
                     V_weight = module.value.weight
-                    Q_weight = Q_weight.detach().cpu()
-                    V_weight = V_weight.detach().cpu()
+                    # K_weight = module.key.weight
+                    Q_weight = Q_weight.detach()
+                    V_weight = V_weight.detach()
+                    # K_weight = K_weight.detach()
                     U_Q = torch.randn((Q_weight.shape[0], 1)).to(Q_weight.device)
                     V_Q = torch.randn((1, Q_weight.shape[1])).to(Q_weight.device)
-                    S_Q = torch.zeros_like(Q_weight)
+                    # S_Q = torch.zeros_like(Q_weight)
 
                     U_V = torch.randn((V_weight.shape[0], 1)).to(V_weight.device)
                     V_V = torch.randn((1, V_weight.shape[1])).to(V_weight.device)
-                    S_V = torch.zeros_like(V_weight)
+                    # S_V = torch.zeros_like(V_weight)
+
+                    U_K = torch.randn((V_weight.shape[0], 1)).to(V_weight.device)
+                    V_K = torch.randn((1, V_weight.shape[1])).to(V_weight.device)
+                    # S_K = torch.zeros_like(V_weight)
+
                     last_S_Q = torch.zeros_like(Q_weight)
 
                     for rank in range(100):
                         S_Q = torch.zeros_like(Q_weight)
-                        S_V = torch.zeros_like(V_weight)
-                        for _ in range(10):
+                        S_V = torch.zeros_like(Q_weight)
+                        # S_K = torch.zeros_like(Q_weight)
+
+                        for _ in range(2):
                             #print(_, residual_change)
                             U_Q = torch.qr((Q_weight - S_Q) @ V_Q.T)[0]
                             V_Q = U_Q.T @ (Q_weight - S_Q)
                             S_Q = Q_weight - U_Q @ V_Q
                             q = 0.01
                             S_Q[S_Q.abs() < q] = 0
-                            residual_change = torch.norm(S_Q - last_S_Q, p=2)
+                            residual = torch.norm(Q_weight - U_Q@V_Q).item()
                             last_S_Q = S_Q
                             
                             U_V = torch.qr((V_weight - S_V) @ V_V.T)[0]
@@ -421,26 +440,49 @@ def main():
                             q = 0.01
                             S_V[S_V.abs() < q] = 0
 
+                            # U_K = torch.qr((V_weight - S_K) @ V_K.T)[0]
+                            # V_K = U_K.T @ (V_weight - S_K)
+                            # S_K = V_weight - U_K @ V_K
+                            #residual_change.append(torch.norm(Q_weight - U_K@V_K).item())
+                            # q = 0.01
+                            # S_K[S_K.abs() < q] = 0
+
                         E_Q = Q_weight - U_Q @ V_Q - S_Q
                         E_V = V_weight - U_V @ V_V - S_V
+                        # E_K = V_weight - U_K @ V_K - S_K
                         
-                        E_Q_vector = torch.qr(E_Q)[1][:1]
-                        E_V_vector = torch.qr(E_V)[1][:1]
+                        E_Q_vector = torch.qr(E_Q)[1][:5]
+                        E_V_vector = torch.qr(E_V)[1][:5]
+                        # E_K_vector = torch.qr(E_K)[1][:5]
                         
                         V_Q = torch.cat([V_Q, E_Q_vector], 0)
                         V_V = torch.cat([V_V, E_V_vector], 0)
+                        # V_K = torch.cat([V_K, E_K_vector], 0)
                     
-                    q, _ = torch.kthvalue(S_Q.abs().view(-1), S_Q.numel() - model_args.num_sparse)
-                    S_Q = (S_Q.abs() >= q).float()
+                    q, _ = torch.kthvalue(S_Q.abs().view(-1), S_Q.numel() - model_args.num_sparse + 1)
+                    S_Q = (S_Q.abs() >= q).float().cuda()
                     #print(S_Q)
-                    v, _ = torch.kthvalue(S_V.abs().view(-1), S_V.numel() - model_args.num_sparse)
-                    S_V = (S_V.abs() >= v).float()
-                    prune.custom_from_mask(module.query_lora_s, 'weight', S_Q)
-                    prune.custom_from_mask(module.value_lora_s, 'weight', S_V)
+                    v, _ = torch.kthvalue(S_V.abs().view(-1), S_V.numel() - model_args.num_sparse + 1)
+                    S_V = (S_V.abs() >= v).float().cuda()
+
+                    # k, _ = torch.kthvalue(S_K.abs().view(-1), S_K.numel() - model_args.num_sparse + 1)
+                    # S_K = (S_K.abs() >= k).float().cuda()
+                    torch.distributed.broadcast(S_Q, 0)
+                    torch.distributed.barrier()
+                    torch.distributed.broadcast(S_V, 0)
+                    torch.distributed.barrier()
+
+                    prune.custom_from_mask(module.query_lora_s, 'weight', S_Q.cpu())
+                    prune.custom_from_mask(module.value_lora_s, 'weight', S_V.cpu())
+                    # prune.custom_from_mask(module.key_lora_s, 'weight', S_K.cpu())
+                    print(residual)
+
+                    # assert False
                 elif name.endswith("self") and name.startswith("deberta"): # SelfAttention
-                    Q_weight, _, V_weight = torch.chunk(module.in_proj.weight, 3, 0)
-                    Q_weight = Q_weight.detach().cpu()
-                    V_weight = V_weight.detach().cpu()
+                    Q_weight, K_weight, V_weight = torch.chunk(module.in_proj.weight, 3, 0)
+                    Q_weight = Q_weight.detach()
+                    V_weight = V_weight.detach()
+                    K_weight = K_weight.detach()
                     U_Q = torch.randn((Q_weight.shape[0], 1)).to(Q_weight.device)
                     V_Q = torch.randn((1, Q_weight.shape[1])).to(Q_weight.device)
                     S_Q = torch.zeros_like(Q_weight)
@@ -448,19 +490,26 @@ def main():
                     U_V = torch.randn((V_weight.shape[0], 1)).to(V_weight.device)
                     V_V = torch.randn((1, V_weight.shape[1])).to(V_weight.device)
                     S_V = torch.zeros_like(V_weight)
+
+                    U_K = torch.randn((V_weight.shape[0], 1)).to(V_weight.device)
+                    V_K = torch.randn((1, V_weight.shape[1])).to(V_weight.device)
+                    S_K = torch.zeros_like(V_weight)
+
                     last_S_Q = torch.zeros_like(Q_weight)
-                    residual_change = 0
+
                     for rank in range(100):
                         S_Q = torch.zeros_like(Q_weight)
-                        S_V = torch.zeros_like(V_weight)
-                        for _ in range(10):
+                        S_V = torch.zeros_like(Q_weight)
+                        # S_K = torch.zeros_like(Q_weight)
+
+                        for _ in range(2):
                             #print(_, residual_change)
                             U_Q = torch.qr((Q_weight - S_Q) @ V_Q.T)[0]
                             V_Q = U_Q.T @ (Q_weight - S_Q)
                             S_Q = Q_weight - U_Q @ V_Q
                             q = 0.01
                             S_Q[S_Q.abs() < q] = 0
-                            residual_change = torch.norm(S_Q - last_S_Q, p=2)
+                            residual = torch.norm(Q_weight - U_Q@V_Q).item()
                             last_S_Q = S_Q
                             
                             U_V = torch.qr((V_weight - S_V) @ V_V.T)[0]
@@ -470,36 +519,57 @@ def main():
                             q = 0.01
                             S_V[S_V.abs() < q] = 0
 
+                            # U_K = torch.qr((V_weight - S_K) @ V_K.T)[0]
+                            # V_K = U_K.T @ (V_weight - S_K)
+                            # S_K = V_weight - U_K @ V_K
+                            #residual_change.append(torch.norm(Q_weight - U_K@V_K).item())
+                            # q = 0.01
+                            # S_K[S_K.abs() < q] = 0
+
                         E_Q = Q_weight - U_Q @ V_Q - S_Q
                         E_V = V_weight - U_V @ V_V - S_V
+                        # E_K = V_weight - U_K @ V_K - S_K
                         
-                        E_Q_vector = torch.qr(E_Q)[1][:1]
-                        E_V_vector = torch.qr(E_V)[1][:1]
+                        E_Q_vector = torch.qr(E_Q)[1][:5]
+                        E_V_vector = torch.qr(E_V)[1][:5]
+                        # E_K_vector = torch.qr(E_K)[1][:5]
                         
                         V_Q = torch.cat([V_Q, E_Q_vector], 0)
                         V_V = torch.cat([V_V, E_V_vector], 0)
-                    
-                    q, _ = torch.kthvalue(S_Q.abs().view(-1), S_Q.numel() - model_args.num_sparse)
-                    S_Q = (S_Q.abs() >= q).float()
-                    #print(S_Q)
-                    v, _ = torch.kthvalue(S_V.abs().view(-1), S_V.numel() - model_args.num_sparse)
-                    S_V = (S_V.abs() >= v).float()
+                        # V_K = torch.cat([V_K, E_K_vector], 0)
+ 
+                    q, _ = torch.kthvalue(S_Q.abs().view(-1), S_Q.numel() - model_args.num_sparse + 1)
+                    S_Q = (S_Q.abs() >= q).float().cuda()
+                        #print(S_Q)
+                    v, _ = torch.kthvalue(S_V.abs().view(-1), S_V.numel() - model_args.num_sparse + 1)
+                    S_V = (S_V.abs() >= v).float().cuda()
 
-                    prune.custom_from_mask(module.query_lora_s, 'weight', S_Q)
-                    prune.custom_from_mask(module.value_lora_s, 'weight', S_V)
+                    torch.distributed.broadcast(S_Q, 0)
+                    torch.distributed.barrier()
+                    torch.distributed.broadcast(S_V, 0)
+                    torch.distributed.barrier()
+
+                    prune.custom_from_mask(module.query_lora_s, 'weight', S_Q.cpu())
+                    prune.custom_from_mask(module.value_lora_s, 'weight', S_V.cpu())
+                    # prune.custom_from_mask(module.key_lora_s, 'weight', S_K.cpu())
+                    print(residual)
+
         elif model_args.sparse_method == 'rp':
             for name, module in model.named_modules():
                 print(name)
                 if name.endswith("self") and name.startswith("bert"): # SelfAttention
                     S_Q = torch.randn(module.query_lora_s.weight.shape)
                     S_V = torch.randn(module.value_lora_s.weight.shape)
-                    q, _ = torch.kthvalue(S_Q.abs().view(-1), S_Q.numel() - model_args.num_sparse)
-                    S_Q = (S_Q.abs() >= q).float()
+                    q, _ = torch.kthvalue(S_Q.abs().view(-1), S_Q.numel() - model_args.num_sparse + 1)
+                    S_Q = (S_Q.abs() >= q).float().cuda()
                     #print(S_Q)
-                    v, _ = torch.kthvalue(S_V.abs().view(-1), S_V.numel() - model_args.num_sparse)
-                    S_V = (S_V.abs() >= v).float()
-                    prune.custom_from_mask(module.query_lora_s, 'weight', S_Q)
-                    prune.custom_from_mask(module.value_lora_s, 'weight', S_V)
+                    v, _ = torch.kthvalue(S_V.abs().view(-1), S_V.numel() - model_args.num_sparse + 1)
+                    S_V = (S_V.abs() >= v).float().cuda()
+                    torch.distributed.broadcast(S_V, 0)
+                    torch.distributed.broadcast(S_Q, 0)
+                    torch.distributed.barrier()
+                    prune.custom_from_mask(module.query_lora_s, 'weight', S_Q.cpu())
+                    prune.custom_from_mask(module.value_lora_s, 'weight', S_V.cpu())
                 elif name.endswith("self") and name.startswith("deberta"):
                     S_Q = torch.randn(module.query_lora_s.weight.shape)
                     S_V = torch.randn(module.value_lora_s.weight.shape)
@@ -512,7 +582,7 @@ def main():
                     prune.custom_from_mask(module.value_lora_s, 'weight', S_V)
         elif model_args.sparse_method == 'omp':
             for name, module in model.named_modules():
-
+                print(name)
                 if name.endswith("self") and name.startswith("bert"): # SelfAttention
                     Q_weight = module.query.weight
                     V_weight = module.value.weight
@@ -520,10 +590,10 @@ def main():
                     V_weight = V_weight.detach().cpu()
                     S_Q = Q_weight
                     S_V = V_weight
-                    q, _ = torch.kthvalue(S_Q.abs().view(-1), S_Q.numel() - model_args.num_sparse)
+                    q, _ = torch.kthvalue(S_Q.abs().view(-1), S_Q.numel() - model_args.num_sparse + 1)
                     S_Q = (S_Q.abs() >= q).float()
                     #print(S_Q)
-                    v, _ = torch.kthvalue(S_V.abs().view(-1), S_V.numel() - model_args.num_sparse)
+                    v, _ = torch.kthvalue(S_V.abs().view(-1), S_V.numel() - model_args.num_sparse + 1)
                     S_V = (S_V.abs() >= v).float()
                     prune.custom_from_mask(module.query_lora_s, 'weight', S_Q)
                     prune.custom_from_mask(module.value_lora_s, 'weight', S_V)
@@ -541,7 +611,24 @@ def main():
                     prune.custom_from_mask(module.query_lora_s, 'weight', S_Q)
                     prune.custom_from_mask(module.value_lora_s, 'weight', S_V)
 
+        elif model_args.sparse_method == 'svd':
+            for name, module in model.named_modules():
+                print(name)
+                if name.endswith("self") and name.startswith("bert"): # SelfAttention
+                    Q_weight = module.query.weight
+                    V_weight = module.value.weight
+                    Q_weight = Q_weight.detach().cpu()
+                    V_weight = V_weight.detach().cpu()
+                    S_Q = Q_weight
+                    S_V = V_weight
+                    torch.svd(S_Q)
+                    torch.svd(S_V)
+            end = time.time()
+            print(f"TIME: {end-start}")
+            raise NotImplementedError
+        end = time.time()
 
+        print(f"TIME: {end-start}")
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
         sentence1_key, sentence2_key = task_to_keys[data_args.task_name]
