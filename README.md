@@ -3,7 +3,7 @@
 
 Codes for [ACL 2023] [DSEE: Dually Sparsity-embedded Efficient Tuning of Pre-trained Language Models](https://arxiv.org/abs/2111.00160)
 
-Xuxi Chen, Tianlong Chen, Weizhu Chen, Zhangyang Wang, Ahmed Hassan Awadallah, Yu Cheng
+Xuxi Chen, Tianlong Chen, Weizhu Chen, Ahmed Hassan Awadallah, Zhangyang Wang, Yu Cheng
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
